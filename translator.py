@@ -1,4 +1,4 @@
-"""
+﻿"""
 Click Translator - 点击即翻译桌面工具
 支持：鼠标双击触发取词 / 右键菜单触发翻译 / 悬浮翻译结果窗口
 """
@@ -69,19 +69,38 @@ class TranslatorEngine:
         text = text.strip()
         if not text or len(text) > 2000:
             return {"error": "文本为空或过长"}
-        try:
-            if self.engine == "tencent":
-                return self._tencent(text)
-            elif self.engine == "youdao":
-                return self._youdao(text)
-            elif self.engine == "google":
-                return self._google(text)
-            elif self.engine == "bing":
-                return self._bing(text)
-            elif self.engine == "baidu":
-                return self._baidu(text)
-        except Exception as e:
-            return {"error": str(e)}
+        last_err = ""
+        for attempt in range(2):  # 最多重试1次
+            try:
+                if self.engine == "tencent":
+                    return self._tencent(text)
+                elif self.engine == "youdao":
+                    return self._youdao(text)
+                elif self.engine == "google":
+                    return self._google(text)
+                elif self.engine == "bing":
+                    return self._bing(text)
+                elif self.engine == "baidu":
+                    return self._baidu(text)
+            except requests.exceptions.ConnectionError:
+                last_err = "网络连接失败，请检查网络"
+                time.sleep(0.8)
+            except requests.exceptions.Timeout:
+                last_err = "翻译请求超时，请稍后重试"
+                time.sleep(1.0)
+            except Exception as e:
+                err = str(e)
+                # 提供友好提示
+                if "401" in err or "403" in err:
+                    last_err = "认证失败，翻译服务可能需要更新"
+                elif "429" in err:
+                    last_err = "请求过于频繁，请稍后再试"
+                elif "ret_code" in err:
+                    last_err = f"翻译接口错误: {err}"
+                else:
+                    last_err = f"翻译失败: {err}"
+                break  # 非网络错误不重试
+        return {"error": last_err}
 
     def _tencent(self, text: str) -> dict:
         """腾讯翻译（transmart，国内直连，完全免费，无需Key）"""
@@ -265,66 +284,87 @@ class WordGrabber:
     """从鼠标位置取词：优先剪贴板选词，其次 OCR"""
 
     def get_word_at_cursor(self, x: int, y: int, use_ocr=False) -> str:
-        """尝试通过模拟 Ctrl+C 获取选中文字"""
-        # 保存原剪贴板内容
+        """尝试通过模拟 Ctrl+C 获取选中文字（最多重试3次）"""
         old_clip = self._get_clipboard()
-        # 清空剪贴板，发送 Ctrl+C
-        self._set_clipboard("")
-        time.sleep(0.05)
-        pyautogui.hotkey('ctrl', 'c')
-        time.sleep(0.15)
-        new_clip = self._get_clipboard()
-        # 还原
+        for attempt in range(3):
+            self._set_clipboard("")
+            time.sleep(0.08)
+            pyautogui.press('escape')
+            time.sleep(0.05)
+            pyautogui.hotkey('ctrl', 'c')
+            time.sleep(0.2)
+            new_clip = self._get_clipboard()
+            if new_clip and new_clip.strip() and new_clip.strip() != old_clip:
+                if old_clip:
+                    self._set_clipboard(old_clip)
+                return new_clip.strip()
         if old_clip:
             self._set_clipboard(old_clip)
-
-        if new_clip and new_clip.strip():
-            return new_clip.strip()
         return ""
 
     def get_word_from_selection(self) -> str:
         """直接获取当前选中的文本"""
         old_clip = self._get_clipboard()
-        self._set_clipboard("")
-        time.sleep(0.05)
-        pyautogui.hotkey('ctrl', 'c')
-        time.sleep(0.15)
-        text = self._get_clipboard()
+        for attempt in range(3):
+            self._set_clipboard("")
+            time.sleep(0.08)
+            # 按 Escape 确保输入法不会干扰 Ctrl+C
+            pyautogui.press('escape')
+            time.sleep(0.05)
+            pyautogui.hotkey('ctrl', 'c')
+            time.sleep(0.2)
+            text = self._get_clipboard()
+            if text and text.strip() and text.strip() != old_clip:
+                if old_clip:
+                    self._set_clipboard(old_clip)
+                return text.strip()
         if old_clip:
             self._set_clipboard(old_clip)
-        return text.strip() if text else ""
+        return ""
 
     def _get_clipboard(self) -> str:
+        data = ""
         try:
             win32clipboard.OpenClipboard()
             if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
                 data = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-            else:
-                data = ""
-            win32clipboard.CloseClipboard()
-            return data
         except Exception:
-            return ""
+            pass
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+        return data if data else ""
 
     def _set_clipboard(self, text: str):
         try:
             win32clipboard.OpenClipboard()
             win32clipboard.EmptyClipboard()
             win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
-            win32clipboard.CloseClipboard()
         except Exception:
             pass
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
 
-    def get_text_from_screenshot(self, x: int, y: int, size: int = 150) -> str:
-        """截图并OCR识别文字"""
+    def get_text_from_screenshot(self, x: int, y: int, size: int = 300) -> str:
+        """
+        截图并OCR识别文字（fallback 模式：在光标附近截取区域识别）。
+        注意：这是 Ctrl+C 取词失败时的备用方案，
+        真正的截图翻译（F8）走 ScreenshotSelector 流程，不经过这里。
+        """
         if not OCR_AVAILABLE:
             return ""
         try:
-            # 截图区域（鼠标周围）
+            from PIL import Image
+            # 截图区域（鼠标周围，增大到 300px 提高命中率）
             left = max(0, x - size // 2)
             top = max(0, y - size // 2)
             screenshot = ImageGrab.grab(bbox=(left, top, left + size, top + size))
-            # OCR识别
+            # OCR识别，优先中文+英文混合
             text = pytesseract.image_to_string(screenshot, lang='eng+chi_sim')
             return text.strip()
         except Exception as e:
@@ -347,6 +387,8 @@ class TranslateWorker(QThread):
 
     def run(self):
         result = self.engine.translate(self.text)
+        # 将原文注入结果字典，避免外部猴子补丁
+        result["_original"] = self.text
         self.result_ready.emit(result, self.x, self.y)
 
 
@@ -842,7 +884,8 @@ class SettingsPanel(QWidget):
         ocr_layout = QVBoxLayout(ocr_group)
         
         self._ocr_checkbox = QCheckBox("启用截图翻译 (选不中文字时使用)")
-        self._ocr_checkbox.setChecked(True)
+        # 只有 OCR 真正可用时才默认勾选
+        self._ocr_checkbox.setChecked(OCR_AVAILABLE)
         ocr_layout.addWidget(self._ocr_checkbox)
         
         ocr_hint = QLabel("💡 如果文字选不中（如图片、PDF扫描件），\n   软件会自动截图并识别文字")
@@ -912,19 +955,23 @@ class SettingsPanel(QWidget):
         }
     
     def _check_ocr_status(self):
-        """检查OCR是否可用"""
+        """检查OCR是否可用，联动复选框状态"""
         if OCR_AVAILABLE:
             try:
-                # 测试tesseract是否可用
                 pytesseract.get_tesseract_version()
                 self._ocr_status.setText("OCR状态: 已就绪")
                 self._ocr_status.setStyleSheet("color: #2ecc71; font-size: 10px;")
-            except Exception as e:
-                self._ocr_status.setText(f"OCR状态: 需要安装Tesseract引擎")
+                self._ocr_checkbox.setEnabled(True)
+            except Exception:
+                self._ocr_status.setText("OCR状态: 需要安装Tesseract引擎")
                 self._ocr_status.setStyleSheet("color: #e74c3c; font-size: 10px;")
+                self._ocr_checkbox.setEnabled(False)
+                self._ocr_checkbox.setChecked(False)
         else:
             self._ocr_status.setText("OCR状态: 未安装 pytesseract")
             self._ocr_status.setStyleSheet("color: #888; font-size: 10px;")
+            self._ocr_checkbox.setEnabled(False)
+            self._ocr_checkbox.setChecked(False)
 
 
 # ─────────────────────────────────────────────
@@ -1103,6 +1150,8 @@ class ClickTranslatorApp:
             text = self.grabber.get_text_from_screenshot(x, y)
         
         if not text:
+            # 不使用托盘通知（频繁弹出会干扰），改为静默返回
+            # 用户下次有选中文字时会正常触发
             return
         
         # 显示加载状态
@@ -1117,6 +1166,14 @@ class ClickTranslatorApp:
     def _on_result_ready(self, result: dict, x: int, y: int):
         original = result.get("_original", "")
         self.popup.show_result(original, result, x, y)
+        
+        # 翻译失败时弹托盘通知（用户可能没注意到弹窗）
+        if result.get("error"):
+            self.tray.showMessage(
+                "Click Translator",
+                f"翻译失败: {result['error']}",
+                QSystemTrayIcon.Warning, 3000
+            )
 
     def _on_screenshot_request(self):
         """F8快捷键触发截图翻译"""
@@ -1177,17 +1234,6 @@ class ClickTranslatorApp:
     def _quit(self):
         self._stop_listener()
         self.app.quit()
-
-
-# ─────────────────────────────────────────────
-# 修补 TranslateWorker 以传递原文
-# ─────────────────────────────────────────────
-_orig_translate_run = TranslateWorker.run
-def _patched_run(self):
-    result = self.engine.translate(self.text)
-    result["_original"] = self.text
-    self.result_ready.emit(result, self.x, self.y)
-TranslateWorker.run = _patched_run
 
 
 if __name__ == "__main__":

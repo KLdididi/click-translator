@@ -1,4 +1,4 @@
-# Click Translator — 点击即翻译
+﻿# Click Translator — 点击即翻译
 
 > 一款 Windows 桌面实时翻译工具，选中文字后触发翻译，结果悬浮显示在光标旁。
 
