@@ -451,14 +451,21 @@ class TranslationPopup(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("popup")
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # 移除 WA_TranslucentBackground（Windows Qt 下会导致事件异常）
+        # 改用正常背景 + 圆角阴影实现透明效果
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowFlags(
             Qt.FramelessWindowHint |
             Qt.WindowStaysOnTopHint |
             Qt.Tool |
             Qt.NoDropShadowWindowHint
         )
-        self.setStyleSheet(self.STYLE)
+        self.setStyleSheet(self.STYLE + """
+            #popup {
+                background: transparent;
+                border-radius: 12px;
+            }
+        """)
         self._drag_pos = None
         self._translated_text = ""
         self._hide_timer = QTimer(self)
@@ -602,9 +609,10 @@ class TranslationPopup(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect().adjusted(0, 0, -1, -1)
+        # 透明背景方案：半透明深色渐变 + 边框
         gradient = QLinearGradient(0, 0, 0, rect.height())
-        gradient.setColorAt(0, QColor("#1e1e2e"))
-        gradient.setColorAt(1, QColor("#16213e"))
+        gradient.setColorAt(0, QColor(30, 30, 46, 240))
+        gradient.setColorAt(1, QColor(22, 33, 62, 240))
         painter.setBrush(QBrush(gradient))
         painter.setPen(QPen(QColor("#3d5a80"), 1))
         painter.drawRoundedRect(rect, 12, 12)
@@ -641,7 +649,7 @@ class MouseListenerThread(QThread):
                     # 双击检测：300ms内在相近位置点击两次
                     lx, ly = self._last_click_pos
                     dist = ((x - lx)**2 + (y - ly)**2) ** 0.5
-                    if now - self._last_click_time < 0.35 and dist < 15:
+                    if now - self._last_click_time < 0.5 and dist < 30:
                         self.translate_request.emit(x, y)
                         self._last_click_time = 0
                         return
@@ -978,75 +986,122 @@ class SettingsPanel(QWidget):
 # 截图选择器 - 框选区域
 # ─────────────────────────────────────────────
 class ScreenshotSelector(QWidget):
-    """全屏截图选择器，支持框选区域"""
+    """
+    全屏截图选择器，使用 Windows Overlay 模式，
+    避免 Qt WA_TranslucentBackground 在 Windows 下的兼容性问题。
+    按 ESC 取消，左键拖拽框选，右键退出。
+    """
     
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # 使用 SubSurface 在桌面之上、其余窗口之下
+        # 不使用 Tool/Frameless+透明背景（Windows Qt BUG）
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.setCursor(Qt.CrossCursor)
         
-        # 获取屏幕尺寸
+        # 全屏尺寸
         screen = QApplication.primaryScreen().geometry()
         self.setGeometry(screen)
+        
+        # ── 全屏半透明遮罩层 ──
+        self._overlay = QLabel(self)
+        self._overlay.setGeometry(0, 0, screen.width(), screen.height())
+        self._overlay.setStyleSheet("background: rgba(0, 0, 0, 150);")
+        self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        
+        # ── 操作提示 ──
+        self._hint = QLabel("拖拽框选区域  |  ESC 取消  |  右键退出", self)
+        self._hint.setStyleSheet(
+            "color: white; background: rgba(0,0,0,0); "
+            "font-size: 14px; padding: 8px 16px;"
+        )
+        self._hint.adjustSize()
+        self._hint.move(20, 20)
+        self._hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        
+        # ── 尺寸标签（跟随鼠标显示选区大小）──
+        self._size_label = QLabel("", self)
+        self._size_label.setStyleSheet(
+            "color: white; background: rgba(30,30,50,180); "
+            "font-size: 12px; padding: 2px 8px; border-radius: 4px;"
+        )
+        self._size_label.hide()
+        self._size_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         
         self.start_pos = None
         self.end_pos = None
         self.drawing = False
+        self._selection_rect = None
         
-        # 半透明遮罩
-        self.overlay = QPixmap(screen.size())
-        self.overlay.fill(QColor(0, 0, 0, 100))
-        
+        self.grabKeyboard()
+    
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.drawPixmap(0, 0, self.overlay)
-        
-        if self.drawing and self.start_pos and self.end_pos:
-            # 绘制选择框
-            rect = QRect(self.start_pos, self.end_pos).normalized()
-            painter.setPen(QPen(QColor("#2ecc71"), 2))
-            painter.setBrush(QBrush(QColor(46, 204, 113, 50)))
-            painter.drawRect(rect)
-            
-            # 显示尺寸
-            painter.setPen(QColor("white"))
-            painter.setFont(QFont("Microsoft YaHei", 10))
-            size_text = f"{rect.width()} x {rect.height()}"
-            painter.drawText(rect.x() + 5, rect.y() - 5, size_text)
+        # 绘制选择框（从遮罩上"挖出"透明区域）
+        if self._selection_rect:
+            qp = QPainter(self)
+            qp.setPen(QPen(QColor("#00d4ff"), 2))
+            qp.setBrush(QBrush(QColor(0, 212, 255, 30)))
+            qp.drawRect(self._selection_rect)
+            # 选区尺寸文字
+            w = self._selection_rect.width()
+            h = self._selection_rect.height()
+            self._size_label.setText(f" {w} × {h} ")
+            self._size_label.adjustSize()
+            # 放在选区右下角，避免超出屏幕
+            sl_pos = self._selection_rect.bottomRight()
+            screen = QApplication.primaryScreen().geometry()
+            lx = min(sl_pos.x() + 4, screen.width() - self._size_label.width() - 4)
+            ly = min(sl_pos.y() + 2, screen.height() - self._size_label.height() - 4)
+            self._size_label.move(lx, ly)
+            self._size_label.show()
     
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self._size_label.hide()
             self.start_pos = event.pos()
             self.end_pos = event.pos()
             self.drawing = True
-            self.update()
     
     def mouseMoveEvent(self, event):
         if self.drawing:
             self.end_pos = event.pos()
+            self._selection_rect = QRect(self.start_pos, self.end_pos).normalized()
             self.update()
     
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.drawing:
             self.drawing = False
             self.end_pos = event.pos()
+            self._selection_rect = QRect(self.start_pos, self.end_pos).normalized()
+            self.update()
             
-            # 回调并关闭
-            if self.start_pos and self.end_pos:
-                self.callback(
-                    self.start_pos.x(), self.start_pos.y(),
-                    self.end_pos.x(), self.end_pos.y()
-                )
-            self.close()
+            rect = self._selection_rect
+            if rect.width() >= 5 and rect.height() >= 5:
+                self.close()
+                # 延迟回调，确保窗口已关闭
+                QTimer.singleShot(50, lambda: self.callback(
+                    rect.left(), rect.top(), rect.right(), rect.bottom()
+                ))
+            else:
+                self.close()
         elif event.button() == Qt.RightButton:
-            # 右键取消
             self.close()
+    
+    def closeEvent(self, event):
+        self.releaseKeyboard()
+        event.accept()
     
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close()
+        super().keyPressEvent(event)
 
 
 # ─────────────────────────────────────────────
@@ -1143,25 +1198,33 @@ class ClickTranslatorApp:
 
     def _on_translate_request(self, x: int, y: int):
         """获取当前选中文字并翻译，如果选不中则尝试OCR截图"""
-        text = self.grabber.get_word_from_selection()
-        
-        # 如果剪贴板没有文字，且启用了OCR，尝试截图识别
-        if not text and OCR_AVAILABLE and getattr(self, '_ocr_enabled', True):
-            text = self.grabber.get_text_from_screenshot(x, y)
-        
-        if not text:
-            # 不使用托盘通知（频繁弹出会干扰），改为静默返回
-            # 用户下次有选中文字时会正常触发
-            return
-        
-        # 显示加载状态
-        self.popup.show_loading(x, y)
-        # 异步翻译
-        if self._worker and self._worker.isRunning():
-            self._worker.terminate()
-        self._worker = TranslateWorker(self.engine, text, x, y)
-        self._worker.result_ready.connect(self._on_result_ready)
-        self._worker.start()
+        try:
+            text = self.grabber.get_word_from_selection()
+            
+            # 如果剪贴板没有文字，且启用了OCR，尝试截图识别
+            if not text and OCR_AVAILABLE and getattr(self, '_ocr_enabled', True):
+                text = self.grabber.get_text_from_screenshot(x, y)
+            
+            if not text:
+                return
+            
+            # 显示加载状态
+            self.popup.show_loading(x, y)
+            # 异步翻译
+            if self._worker and self._worker.isRunning():
+                self._worker.terminate()
+            self._worker = TranslateWorker(self.engine, text, x, y)
+            self._worker.result_ready.connect(self._on_result_ready)
+            self._worker.start()
+        except Exception as e:
+            try:
+                self.tray.showMessage(
+                    "Click Translator",
+                    f"取词失败: {str(e)}",
+                    QSystemTrayIcon.Warning, 3000
+                )
+            except Exception:
+                pass  # 完全兜底，不闪退
 
     def _on_result_ready(self, result: dict, x: int, y: int):
         original = result.get("_original", "")
